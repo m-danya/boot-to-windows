@@ -1,0 +1,327 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_NAME="Boot to Windows"
+DRY_RUN=0
+NO_ELEVATE=0
+SYSTEMD_ENTRY="${BOOT_TO_WINDOWS_ENTRY:-${WINDOWS_BOOT_ENTRY:-}}"
+GRUB_ENTRY="${BOOT_TO_WINDOWS_GRUB_ENTRY:-}"
+
+usage() {
+  cat <<'EOF'
+Usage: boot-to-windows [options]
+
+Set Windows as the next boot target and reboot.
+
+Options:
+  --dry-run          Print the detected method without rebooting.
+  --entry ID         Use a specific systemd-boot loader entry ID.
+  --grub-entry NAME  Use a specific GRUB menu entry name.
+  --no-elevate      Do not try to re-run through pkexec.
+  -h, --help         Show this help.
+
+Environment overrides:
+  BOOT_TO_WINDOWS_ENTRY       systemd-boot entry ID, for example auto-windows
+  WINDOWS_BOOT_ENTRY          alias for BOOT_TO_WINDOWS_ENTRY
+  BOOT_TO_WINDOWS_GRUB_ENTRY  GRUB menu entry title
+EOF
+}
+
+log() {
+  printf '%s\n' "$*" >&2
+}
+
+show_error() {
+  local message="$*"
+
+  if [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
+    if command -v zenity >/dev/null 2>&1; then
+      zenity --error --title="$APP_NAME" --text="$message" >/dev/null 2>&1 || true
+    elif command -v kdialog >/dev/null 2>&1; then
+      kdialog --title "$APP_NAME" --error "$message" >/dev/null 2>&1 || true
+    elif command -v notify-send >/dev/null 2>&1; then
+      notify-send "$APP_NAME" "$message" >/dev/null 2>&1 || true
+    fi
+  fi
+
+  log "$message"
+}
+
+die() {
+  show_error "$*"
+  exit 1
+}
+
+self_path() {
+  if command -v realpath >/dev/null 2>&1; then
+    realpath -- "$0"
+    return
+  fi
+
+  case "$0" in
+    */*) printf '%s\n' "$0" ;;
+    *) command -v -- "$0" ;;
+  esac
+}
+
+ensure_root_if_possible() {
+  if (( EUID == 0 || NO_ELEVATE == 1 )); then
+    return
+  fi
+
+  if command -v pkexec >/dev/null 2>&1 && [[ -z "${BOOT_TO_WINDOWS_ELEVATED:-}" ]]; then
+    local self
+    self="$(self_path)"
+
+    local -a env_args=("BOOT_TO_WINDOWS_ELEVATED=1")
+    local name
+    for name in \
+      DISPLAY \
+      WAYLAND_DISPLAY \
+      XAUTHORITY \
+      XDG_RUNTIME_DIR \
+      DBUS_SESSION_BUS_ADDRESS \
+      BOOT_TO_WINDOWS_ENTRY \
+      WINDOWS_BOOT_ENTRY \
+      BOOT_TO_WINDOWS_GRUB_ENTRY
+    do
+      if [[ -n "${!name:-}" ]]; then
+        env_args+=("$name=${!name}")
+      fi
+    done
+
+    exec pkexec env "${env_args[@]}" "$self" "$@"
+  fi
+}
+
+find_systemd_windows_entry() {
+  command -v bootctl >/dev/null 2>&1 || return 1
+
+  bootctl list --no-pager 2>/dev/null | awk '
+    function clean(value) {
+      sub(/^[^:]*:[[:space:]]*/, "", value)
+      return value
+    }
+
+    /^[[:space:]]*title:[[:space:]]*/ {
+      title = clean($0)
+      next
+    }
+
+    /^[[:space:]]*id:[[:space:]]*/ {
+      id = clean($0)
+      title_l = tolower(title)
+      id_l = tolower(id)
+
+      if (id_l == "auto-windows" || title_l ~ /windows|microsoft/ || id_l ~ /windows|microsoft/) {
+        print id
+        exit
+      }
+
+      title = ""
+      id = ""
+    }
+  '
+}
+
+find_uefi_windows_bootnum() {
+  command -v efibootmgr >/dev/null 2>&1 || return 1
+
+  efibootmgr 2>/dev/null | awk '
+    /^Boot[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]/ {
+      line = $0
+      lower = tolower(line)
+
+      if (lower ~ /windows boot manager|microsoft|windows/) {
+        sub(/^Boot/, "", line)
+        sub(/[ *].*/, "", line)
+        print line
+        exit
+      }
+    }
+  '
+}
+
+find_grub_windows_entry() {
+  local cfg
+  for cfg in /boot/grub/grub.cfg /boot/grub2/grub.cfg; do
+    [[ -r "$cfg" ]] || continue
+
+    awk -F"'" '
+      /^menuentry / {
+        title = $2
+        if (tolower(title) ~ /windows|microsoft/) {
+          print title
+          exit
+        }
+      }
+    ' "$cfg"
+    return
+  done
+}
+
+try_systemd_boot_entry() {
+  local entry="$1"
+  [[ -n "$entry" ]] || return 1
+
+  log "Trying systemd boot loader entry: $entry"
+  if (( DRY_RUN == 1 )); then
+    printf 'systemd:%s\n' "$entry"
+    return 0
+  fi
+
+  systemctl reboot --boot-loader-entry="$entry"
+}
+
+try_systemd_boot() {
+  local entry="$SYSTEMD_ENTRY"
+
+  if [[ -z "$entry" ]]; then
+    entry="$(find_systemd_windows_entry || true)"
+  fi
+
+  if [[ -n "$entry" ]] && try_systemd_boot_entry "$entry"; then
+    return 0
+  fi
+
+  if [[ -z "$SYSTEMD_ENTRY" ]] && try_systemd_boot_entry "auto-windows"; then
+    return 0
+  fi
+
+  return 1
+}
+
+try_uefi_bootnext() {
+  command -v efibootmgr >/dev/null 2>&1 || return 1
+
+  local bootnum
+  bootnum="$(find_uefi_windows_bootnum || true)"
+  [[ -n "$bootnum" ]] || return 1
+
+  log "Trying UEFI BootNext entry: Boot$bootnum"
+  if (( DRY_RUN == 1 )); then
+    printf 'uefi:Boot%s\n' "$bootnum"
+    return 0
+  fi
+
+  efibootmgr -n "$bootnum" && systemctl reboot
+}
+
+try_grub_reboot() {
+  command -v grub-reboot >/dev/null 2>&1 || return 1
+
+  local entry="$GRUB_ENTRY"
+  if [[ -z "$entry" ]]; then
+    entry="$(find_grub_windows_entry || true)"
+  fi
+  [[ -n "$entry" ]] || return 1
+
+  log "Trying GRUB one-shot entry: $entry"
+  if (( DRY_RUN == 1 )); then
+    printf 'grub:%s\n' "$entry"
+    return 0
+  fi
+
+  grub-reboot "$entry" && systemctl reboot
+}
+
+dry_run_report() {
+  local found=0
+  local entry="$SYSTEMD_ENTRY"
+
+  printf 'Will try these methods in order:\n'
+
+  if [[ -n "$entry" ]]; then
+    printf '  1. systemd boot loader entry: %s (override)\n' "$entry"
+    found=1
+  else
+    entry="$(find_systemd_windows_entry || true)"
+    if [[ -n "$entry" ]]; then
+      printf '  1. systemd boot loader entry: %s\n' "$entry"
+      found=1
+    else
+      printf '  1. systemd boot loader entry: auto-windows (fallback attempt, not detected)\n'
+    fi
+  fi
+
+  local bootnum
+  bootnum="$(find_uefi_windows_bootnum || true)"
+  if [[ -n "$bootnum" ]]; then
+    printf '  2. UEFI BootNext entry: Boot%s\n' "$bootnum"
+    found=1
+  else
+    printf '  2. UEFI BootNext entry: not detected\n'
+  fi
+
+  local grub_entry="$GRUB_ENTRY"
+  if [[ -z "$grub_entry" ]]; then
+    grub_entry="$(find_grub_windows_entry || true)"
+  fi
+
+  if [[ -n "$grub_entry" ]]; then
+    printf '  3. GRUB one-shot entry: %s\n' "$grub_entry"
+    found=1
+  else
+    printf '  3. GRUB one-shot entry: not detected\n'
+  fi
+
+  if (( found == 0 )); then
+    return 1
+  fi
+}
+
+main() {
+  local -a original_args=("$@")
+
+  while (($#)); do
+    case "$1" in
+      --dry-run)
+        DRY_RUN=1
+        ;;
+      --entry)
+        shift
+        [[ $# -gt 0 ]] || die "--entry needs a value"
+        SYSTEMD_ENTRY="$1"
+        ;;
+      --grub-entry)
+        shift
+        [[ $# -gt 0 ]] || die "--grub-entry needs a value"
+        GRUB_ENTRY="$1"
+        ;;
+      --no-elevate)
+        NO_ELEVATE=1
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "Unknown option: $1"
+        ;;
+    esac
+    shift
+  done
+
+  if (( DRY_RUN == 0 )); then
+    ensure_root_if_possible "${original_args[@]}"
+  else
+    dry_run_report || die "No Windows boot target was detected. You can override it with --entry or --grub-entry."
+    exit 0
+  fi
+
+  if try_systemd_boot; then
+    exit 0
+  fi
+
+  if try_uefi_bootnext; then
+    exit 0
+  fi
+
+  if try_grub_reboot; then
+    exit 0
+  fi
+
+  die "Could not find a Windows boot target. Try running: boot-to-windows --dry-run"
+}
+
+main "$@"
