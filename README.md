@@ -8,7 +8,16 @@ Install for the current user:
 ./install.sh
 ```
 
-The launcher installs into the application menu as **Boot to Windows**.
+The launcher installs into the application menu as **Boot to Windows**. During
+installation it may ask for administrator authentication once to install a
+root-owned helper and a polkit rule. After that, clicking the desktop launcher
+does not ask for a password.
+
+To install only the user launcher and keep the old password prompt behavior:
+
+```sh
+./install.sh --no-polkit
+```
 
 Before rebooting, you can inspect what method will be used:
 

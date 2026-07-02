@@ -2,6 +2,8 @@
 set -euo pipefail
 
 APP_NAME="Boot to Windows"
+APP_ID="boot-to-windows"
+PRIVILEGED_HELPER="${BOOT_TO_WINDOWS_PRIVILEGED_HELPER:-/usr/local/libexec/$APP_ID/$APP_ID}"
 DRY_RUN=0
 NO_ELEVATE=0
 SYSTEMD_ENTRY="${BOOT_TO_WINDOWS_ENTRY:-${WINDOWS_BOOT_ENTRY:-}}"
@@ -64,12 +66,42 @@ self_path() {
   esac
 }
 
+run_privileged_helper() {
+  command -v pkexec >/dev/null 2>&1 || return 1
+  [[ -x "$PRIVILEGED_HELPER" ]] || return 1
+
+  local -a helper_args=()
+  if [[ -n "$SYSTEMD_ENTRY" ]]; then
+    helper_args+=(--entry "$SYSTEMD_ENTRY")
+  fi
+  if [[ -n "$GRUB_ENTRY" ]]; then
+    helper_args+=(--grub-entry "$GRUB_ENTRY")
+  fi
+
+  local output
+  if output="$(pkexec "$PRIVILEGED_HELPER" "${helper_args[@]}" 2>&1)"; then
+    exit 0
+  fi
+
+  local status=$?
+  if [[ -n "$output" ]]; then
+    show_error "$output"
+  elif (( status == 126 )); then
+    show_error "Reboot to Windows was cancelled."
+  else
+    show_error "Could not run the privileged helper. Try reinstalling with: ./install.sh"
+  fi
+  exit "$status"
+}
+
 ensure_root_if_possible() {
   if (( EUID == 0 || NO_ELEVATE == 1 )); then
     return
   fi
 
   if command -v pkexec >/dev/null 2>&1 && [[ -z "${BOOT_TO_WINDOWS_ELEVATED:-}" ]]; then
+    run_privileged_helper || true
+
     local self
     self="$(self_path)"
 
